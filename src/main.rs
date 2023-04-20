@@ -3,6 +3,8 @@
 #![no_std]
 #![no_main]
 
+// https://rtic.rs/1/book/en/by-example/monotonic.html
+
 // Halt on panic
 use crate::hal::{
     dwt::{ClockDuration, DwtExt},
@@ -13,8 +15,15 @@ use cortex_m_rt::entry;
 use defmt::{global_logger, println};
 use embedded_hal::spi::{Mode, Phase, Polarity};
 use hal::spi::Spi;
-use heapless::{pool, Deque, pool::singleton::{Box, Pool}};
+use heapless::{
+    pool,
+    pool::singleton::{Box, Pool},
+    Deque,
+};
 use stm32f4xx_hal as hal;
+
+mod modbus;
+use modbus::Modbus;
 
 use embedded_graphics::{
     mono_font::{ascii, MonoTextStyleBuilder},
@@ -122,13 +131,16 @@ use rmodbus::{self, server::ModbusFrame};
 mod app {
     use super::*;
     use embedded_hal::blocking::spi;
-    use heapless::{Vec, spsc::{Producer, Consumer}};
+    use heapless::{
+        spsc::{Consumer, Producer},
+        Vec,
+    };
     use rmodbus::{
         consts::{MODBUS_ERROR_ILLEGAL_DATA_ADDRESS, MODBUS_GET_HOLDINGS, MODBUS_GET_INPUTS},
         VectorTrait,
     };
     use rtic::export::CriticalSection;
-    use systick_monotonic::*;
+    use systick_monotonic::{fugit::Duration, ExtU64, Systick};
 
     use hal::{
         gpio::{
@@ -149,7 +161,7 @@ mod app {
 
     // RTIC manual says not to use this in production.
     #[monotonic(binds = SysTick, default = true)]
-    type MyMono = Systick<1>; // 1 Hz / 1 s granularity
+    type MyMono = Systick<100000>; // 1 Hz / 1 s granularity
 
     type SerialModBus = Serial2<(PA2<AF7>, PA3<AF7>), u8>;
 
@@ -161,6 +173,8 @@ mod app {
         dhcp_spawn_at: Option<u32>,
         //mqtt_spawn_at: Option<u32>,
         serial_modbus: SerialModBus,
+        // #[lock_free]
+        modbus: Modbus,
     }
 
     #[local]
@@ -182,7 +196,6 @@ mod app {
         assert_eq!(pos, 4);
 
         let (queue_ser_mb_rx, queue_ser_mb_tx) = cx.local.rxrf_buf.split();
-       
 
         // Set up the LEDs. On the STM32F429I-DISC[O1] they are connected to pin PG13/14.
         let gpioc = dp.GPIOC.split();
@@ -205,7 +218,7 @@ mod app {
         let gpioa = dp.GPIOA.split();
 
         let uart_pins = (gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate());
-        let uart2_config = Config::default().baudrate(9600.bps()).wordlength_8();
+        let uart2_config = Config::default().baudrate(19200.bps()).wordlength_8();
         let mut uart2 = Serial2::new(dp.USART2, uart_pins, uart2_config, &clocks)
             .unwrap()
             .with_u8_data();
@@ -416,8 +429,13 @@ mod app {
         // dhcp_sn::spawn().unwrap();
 
         // start the timeout tracker
-        timeout_tracker::spawn().unwrap();
+        // timeout_tracker::spawn().unwrap();
 
+        // let tmr_handle = tmr_modbus::spawn_after(ExtU64::millis(100)).unwrap();
+
+        let mb = Modbus::new(1);
+
+        defmt::println!("End of init.");
         (
             Shared {
                 w5500,
@@ -426,6 +444,7 @@ mod app {
                 dhcp_spawn_at: None,
                 //mqtt_spawn_at: None,
                 serial_modbus: uart2,
+                modbus: mb,
             },
             Local {
                 eth_int: eth_spi_int,
@@ -646,7 +665,7 @@ mod app {
 
     #[task(shared = [dhcp_spawn_at])]
     fn timeout_tracker(mut cx: timeout_tracker::Context) {
-        timeout_tracker::spawn_after(systick_monotonic::ExtU64::secs(1)).unwrap();
+        timeout_tracker::spawn_after(ExtU64::secs(1)).unwrap();
 
         let now: u32 = monotonic_secs();
 
@@ -673,31 +692,33 @@ mod app {
         // });
     }
 
-    #[task(binds = USART2, priority = 1, shared = [serial_modbus], local = [ buf: Option<Box<SERMB>> = None, queue_ser_mb_rx])]
-    fn uart2_handle(mut ctx: uart2_handle::Context) {
-        ctx.shared.serial_modbus.lock(|serial| {
+    #[task(binds = USART2, shared = [serial_modbus, modbus])]
+    fn uart2_handle(ctx: uart2_handle::Context) {
+        (ctx.shared.modbus, ctx.shared.serial_modbus).lock(|mb, serial| {
             if serial.is_rx_not_empty() {
                 if let Ok(c) = serial.read() {
-                    // println!("UART: {:x}", c);
-                    match ctx.local.buf {
-                        Some(buf) => { 
-                            if buf.push_front(c).is_err() {
-                                println!("UART: Queue is Full");
-                            }
-                            if buf.len() == 4 {
-                                println!("UART: Push On Queue");
-                                let val = ctx.local.buf.take().unwrap();
-                                ctx.local.queue_ser_mb_rx.enqueue(val).unwrap();
-                            }
-                         },
-                        None => if let Some(buf) = SERMB::alloc() {
-                            let mut buf = buf.init(Deque::new());
-                            buf.push_front(c).unwrap();
-                            *ctx.local.buf = Some(buf);
-                        }
-                    }
+                    let delay = ExtU64::secs(10);
+                    mb.tmr = if let Some(tmr) = mb.tmr.take() {
+                        defmt::println!("tmr resched");
+                        tmr.reschedule_after(delay).ok()
+                    } else {
+                        defmt::println!("tmr create");
+                        // let t = tmr_modbus::spawn_at(monotonics::MyMono::now() + delay).ok();
+                        let t = tmr_modbus::spawn_after(delay);
+                        defmt::println!("tmr create done");
+                        Some(t.unwrap())
+                    };
+                    mb.char_recv(c);
                 }
-            }            
+            }
+        });
+    }
+
+    #[task(shared = [modbus], local = [queue_ser_mb_rx])]
+    fn tmr_modbus(mut ctx: tmr_modbus::Context) {
+        defmt::println!("tmr timeout");
+        ctx.shared.modbus.lock(|mb| {
+            mb.is_valid();
         });
     }
 }
