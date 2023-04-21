@@ -98,25 +98,8 @@ fn monotonic_secs() -> u32 {
         .unwrap()
 }
 const MOBBUS_REP_SIZE: usize = 256;
-pool!(SERMB: Deque<u8, MOBBUS_REP_SIZE>);
-
-// #[global_logger]
-// struct Logger;
-
-// unsafe impl defmt::Logger for Logger {
-//     fn acquire() {
-//         // ...
-//     }
-//     unsafe fn flush() {
-//         // ...
-//     }
-//     unsafe fn release() {
-//         // ...
-//     }
-//     unsafe fn write(bytes: &[u8]) {
-//         defmt::write!("{}",)
-//     }
-// }
+type ModbusSerBuf = heapless::Vec<u8, MOBBUS_REP_SIZE>;
+pool!(SERMB: ModbusSerBuf);
 
 // #[rtic::app(
 //     device = hal::pac,
@@ -126,7 +109,7 @@ use rmodbus::{self, server::ModbusFrame};
 
 #[rtic::app(
     device = hal::pac,
-    dispatchers = [USART1, USART6],
+    dispatchers = [USART6, SPI3, SPI4, SPI2],
 )]
 mod app {
     use super::*;
@@ -160,7 +143,7 @@ mod app {
     use rtic::export::Queue;
 
     // RTIC manual says not to use this in production.
-    #[monotonic(binds = SysTick, default = true)]
+    #[monotonic(binds = SysTick, default = true, priority = 2)]
     type MyMono = Systick<100000>; // 1 Hz / 1 s granularity
 
     type SerialModBus = Serial2<(PA2<AF7>, PA3<AF7>), u8>;
@@ -180,7 +163,6 @@ mod app {
     #[local]
     struct Local {
         eth_int: PB0<Input>,
-        queue_ser_mb_rx: Producer<'static, Box<SERMB>, 4>,
         queue_ser_mb_tx: Consumer<'static, Box<SERMB>, 4>,
     }
 
@@ -210,7 +192,7 @@ mod app {
         // let mut delay = dwt.delay();
 
         let systick = cp.SYST;
-        let mono = Systick::new(systick, SYSCLK_HZ);
+        let mono = MyMono::new(systick, SYSCLK_HZ);
 
         println!("Init");
 
@@ -248,7 +230,7 @@ mod app {
         // the Microchip 25aa02e48 EEPROM comes pre-programmed with a valid MAC
         // TODO: investigate why this fails
         let mac = Eui48Addr::new(0xaa, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF);
-        defmt::info!("MAC: {}", mac);
+        defmt::println!("MAC: {}", mac);
 
         w5500_dhcp::ll::reset(&mut eth_rst, &mut CycleDelay::default()).unwrap();
 
@@ -433,7 +415,7 @@ mod app {
 
         // let tmr_handle = tmr_modbus::spawn_after(ExtU64::millis(100)).unwrap();
 
-        let mb = Modbus::new(1);
+        let mb = Modbus::new(1, queue_ser_mb_rx);
 
         defmt::println!("End of init.");
         (
@@ -448,7 +430,6 @@ mod app {
             },
             Local {
                 eth_int: eth_spi_int,
-                queue_ser_mb_rx,
                 queue_ser_mb_tx,
             },
             init::Monotonics(mono),
@@ -487,13 +468,58 @@ mod app {
         // }
     }
 
-    #[idle(local = [queue_ser_mb_tx])]
-    fn idle(cx: idle::Context) -> ! {
-        defmt::info!("[TASK] idle");
+    #[idle(local = [queue_ser_mb_tx], shared = [serial_modbus])]
+    fn idle(mut cx: idle::Context) -> ! {
+        defmt::println!("[TASK] idle");
         loop {
             compiler_fence(SeqCst);
             if let Some(data) = cx.local.queue_ser_mb_tx.dequeue() {
-                println!("Got data {:?}", data.as_slices());
+                println!("Got data {:?}", data.as_slice());
+
+                if let Some(res) = SERMB::alloc() {
+                    let mut res = res.init(Vec::new());
+                    let addr = data[0];
+                    let func = data[1];
+                    let reg = u16::from_be_bytes((&data[2..4]).try_into().unwrap());
+                    let n_size = u16::from_be_bytes((&data[4..6]).try_into().unwrap());
+                    res.push(addr).unwrap();
+                    res.push(func).unwrap();
+                    res.push((n_size << 1) as u8).unwrap();
+                    
+                    let ret: Result<(), ()> = if func == 3 {
+                        match (reg, n_size) {
+                            (3, 1) => res.extend_from_slice(1234u16.to_be_bytes().as_slice()),
+                            (_, _) => Err(()),
+                        }
+                    } else {
+                        Err(())
+                    };
+                    
+
+                    match ret {
+                        Ok(()) => {
+                        },
+                        Err(()) => {
+                            unsafe { res.set_len(1) };
+                            res.push(func | 0x80).unwrap();
+                            res.push(2).unwrap();
+                        }
+                    }
+
+                    
+
+                    let crc = modbus::calc_crc(&res);
+                    res.extend_from_slice(crc.to_le_bytes().as_slice()).unwrap();
+
+                    println!("Reply: {:?}", res.as_slice());
+
+                    cx.shared.serial_modbus.lock(|mb| {
+                        for &d in res.as_slice() {
+                            while !mb.is_tx_empty() {};
+                            mb.write(d).unwrap();
+                        }
+                    });
+                }
             }
         }
     }
@@ -692,33 +718,34 @@ mod app {
         // });
     }
 
-    #[task(binds = USART2, shared = [serial_modbus, modbus])]
+    #[task(binds = USART2, shared = [serial_modbus, modbus], priority = 6)]
     fn uart2_handle(ctx: uart2_handle::Context) {
         (ctx.shared.modbus, ctx.shared.serial_modbus).lock(|mb, serial| {
-            if serial.is_rx_not_empty() {
-                if let Ok(c) = serial.read() {
-                    let delay = ExtU64::secs(10);
-                    mb.tmr = if let Some(tmr) = mb.tmr.take() {
-                        defmt::println!("tmr resched");
-                        tmr.reschedule_after(delay).ok()
-                    } else {
-                        defmt::println!("tmr create");
-                        // let t = tmr_modbus::spawn_at(monotonics::MyMono::now() + delay).ok();
-                        let t = tmr_modbus::spawn_after(delay);
-                        defmt::println!("tmr create done");
-                        Some(t.unwrap())
-                    };
-                    mb.char_recv(c);
-                }
+            let c = if serial.is_rx_not_empty() {
+                serial.read().ok()
+            } else {
+                None
+            };
+
+            if let Some(c) = c {
+                let delay = ExtU64::millis(2);
+                mb.tmr = if let Some(tmr) = mb.tmr.take() {
+                    // defmt::println!("tmr: resched");
+                    tmr.reschedule_after(delay).ok()
+                } else {
+                    // defmt::println!("tmr: create");
+                    // let t = tmr_modbus::spawn_at(monotonics::MyMono::now() + delay).ok();
+                    tmr_modbus::spawn_after(delay).ok()
+                };
+                mb.char_recv(c);
             }
         });
     }
 
-    #[task(shared = [modbus], local = [queue_ser_mb_rx])]
+    #[task(shared = [modbus])]
     fn tmr_modbus(mut ctx: tmr_modbus::Context) {
-        defmt::println!("tmr timeout");
         ctx.shared.modbus.lock(|mb| {
-            mb.is_valid();
+            mb.timer_handle();
         });
     }
 }

@@ -1,6 +1,7 @@
 use core::default;
 use defmt::Format;
-use heapless::Vec;
+use heapless::pool::singleton::{Pool, Box};
+use heapless::{Vec, spsc::Producer};
 use systick_monotonic::fugit::ExtU64;
 
 #[derive(Debug, Default, Format)]
@@ -13,21 +14,40 @@ pub enum ModbusState {
 }
 
 use crate::app::__rtic_internal_tmr_modbus_MyMono_SpawnHandle as SpawnHandle;
+use crate::{ModbusSerBuf, SERMB};
 
 pub struct Modbus {
     buf: Vec<u8, 256>,
     addr: u8,
     state: ModbusState,
     pub tmr: Option<SpawnHandle>,
+    queue: Producer<'static, Box<SERMB>, 4>,
+}
+
+pub fn calc_crc(data: &[u8]) -> u16 {
+    let mut crc = 0xffffu16;
+    for &byte in data {
+        crc ^= u16::from(byte);
+        for _ in 0..8 {
+            let check = crc & 0x0001;
+            crc >>= 1;
+            if check != 0 {
+                crc ^= 0xA001;
+            }
+        }
+    }
+
+    crc
 }
 
 impl Modbus {
-    pub fn new(addr: u8) -> Self {
+    pub fn new(addr: u8, queue: Producer<'static, Box<SERMB>, 4>) -> Self {
         Self {
             buf: Vec::new(),
             addr,
             state: ModbusState::default(),
             tmr: None,
+            queue,
         }
     }
 
@@ -50,28 +70,49 @@ impl Modbus {
                 self.state = ModbusState::Nok;
             }
         }
-        defmt::println!("MB: {:X} {}", data, self.state);
+        // defmt::println!("MB: {:X} {}", data, self.state);
     }
 
     /// Should be called bij de t1.5/t3.5 timer interrupt
-    pub fn is_valid(&mut self) -> bool {
-        let (cancel, valid) = match self.state {
-            ModbusState::InTrans | ModbusState::Nok => {
-                self.buf.clear();
-                (false, false)
-            }
-            ModbusState::Idle | ModbusState::WaitForT3_5 => (true, self.buf.len() >= 4),
+    pub fn timer_handle(&mut self) {
+        let (back_to_idle, valid) = match self.state {
+            ModbusState::InTrans => (false, false),
+            ModbusState::Nok => (false, false),
+            ModbusState::Idle => (true, false),
+            ModbusState::WaitForT3_5 => (true, self.buf.len() >= 4),
         };
 
-        self.tmr.take().map(|handle| {
-            if cancel { 
-                let _ = handle.cancel();
-                None
-            } else {
-                handle.reschedule_after(1146.micros()).ok()
+        if back_to_idle {
+            
+            self.tmr.take().map(|tmr| tmr.cancel());
+            if valid {
+                let crc_start = self.buf.len() - 2;
+                let crc_data = &self.buf[0..crc_start];
+                let crc_calc = calc_crc(crc_data).to_le_bytes();
+                let crc_calc = crc_calc.as_slice();
+                let crc_recv = &self.buf[crc_start..];
+                if crc_calc == crc_recv {
+                    if let Some(buf) = SERMB::alloc() {
+                        let mut d = buf.init(Vec::new());
+                        d.clone_from(&self.buf);
+                        let _ = self.queue.enqueue(d);
+                    }
+                } else {
+                    defmt::println!("CRC C: {:X} R {:X} D: {:X}", crc_calc, crc_recv, crc_data);
+                }
             }
-        });
+            self.buf.clear();
+            self.state = ModbusState::Idle;
+        } else {
+            self.state = ModbusState::WaitForT3_5;
+            self.tmr = crate::app::tmr_modbus::spawn_after(ExtU64::millis(2)).ok();
+        }
 
-        valid
+        //defmt::println!("MB_TMR: {} V: {} T: {}", self.state, valid, self.tmr.is_some());
+    }
+
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.state = ModbusState::Idle;
     }
 }
